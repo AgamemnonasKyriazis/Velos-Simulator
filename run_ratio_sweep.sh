@@ -25,8 +25,7 @@ echo "Output file: ${OUT_FILE}"
   --coarse-step "${COARSE_STEP}" \
   --fine-step "${FINE_STEP}" \
   --radius "${RADIUS}" \
-  --top "${TOP}" \
-  --workers 8 | tee "${OUT_FILE}"\
+  --top "${TOP}" | tee "${OUT_FILE}"\
 
 echo
 echo "Done. Best result:"
