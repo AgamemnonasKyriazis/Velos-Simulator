@@ -1,13 +1,13 @@
 import sys
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import json
 import os
 import random
 from typing import Optional
 import pygame
-
+from pathlib import Path
 
 GRID_H = 4
 GRID_W = 4
@@ -19,10 +19,10 @@ FPS = 60
 MIN_WINDOW_W = 1200
 MIN_WINDOW_H = 700
 
-MODE = "monolithic"  # monolithic | tiled | stateless | smart_stateless | stateful
+MODE = "monolithic"  # monolithic | tiled | stateless | stateful
 AUTO_RUN = True
 RUN_NAME = "sim_run"
-RESULTS_CSV_PATH = "/home/akyriazis/work/PolyBench-CGRA/sim_metrics.csv"
+RESULTS_CSV_PATH = "/home/akyriazis/work/Velos-Metrics/sim_metrics.csv"
 EXPORT_ON_FINISH = True
 CLEAN_RESULTS_ON_BOOT = True
 HOST_ENQUEUE_LATENCY = 100
@@ -31,7 +31,7 @@ CONFIG_COST_PER_AREA = 3000
 STATELESS_COST_PER_AREA = 0
 STATEFUL_COST_PER_AREA = int(CONFIG_COST_PER_AREA + 30)
 DEFRAG_TRIGGER_FREE_AREA_MULTIPLIER = 2
-SMART_STATELESS_COMPLETION_THRESHOLD = 0.50
+STATELESS_TOLERANCE_FACTORS = [0.8, 1.0]
 NON_MONOLITHIC_BW_FACTOR = 3.0
 
 
@@ -45,7 +45,8 @@ MAX_JOB_W      = 2
 
 WORKLOAD_PROFILE = "load_from_file"  # stateful_vs_tiled | uniform_random | realistic | load_from_file
 WORKLOAD_SEED = 2337
-TASK_QUEUE_FILE = "/home/akyriazis/tmp/ratio_candidates/20260311_202124/rank_01_task_queue.json"
+TASK_QUEUE_DIR  = "20260313_220940"
+TASK_QUEUE_FILE = Path.home() / "tmp/ratio_candidates" / TASK_QUEUE_DIR / "rank_01_task_queue.json"
 
 DEFAULT_FRAGMENT_RATIO = 0.45
 DEFAULT_ELEPHANT_RATIO = 0.20
@@ -83,7 +84,7 @@ class ArchitectureModel:
     stateless_cost_per_area: int
     stateful_cost_per_area: int
     defrag_trigger_free_area_multiplier: float
-    smart_stateless_completion_threshold: float
+    stateless_tolerance_factor: Optional[float]
     non_monolithic_bw_factor: float
 
     def validate(self):
@@ -95,8 +96,6 @@ class ArchitectureModel:
             raise ValueError("Cost parameters must be >= 0")
         if self.defrag_trigger_free_area_multiplier < 0:
             raise ValueError("Defrag trigger multiplier must be >= 0")
-        if not (0.0 <= self.smart_stateless_completion_threshold <= 1.0):
-            raise ValueError("Smart stateless threshold must be in [0,1]")
         if self.non_monolithic_bw_factor <= 0:
             raise ValueError("Non-monolithic BW factor must be > 0")
 
@@ -318,6 +317,7 @@ def maybe_clean_results_on_boot():
 
 
 def build_default_architecture() -> ArchitectureModel:
+    default_stateless_tolerance = STATELESS_TOLERANCE_FACTORS[0] if STATELESS_TOLERANCE_FACTORS else None
     arch = ArchitectureModel(
         grid_h=GRID_H,
         grid_w=GRID_W,
@@ -326,11 +326,21 @@ def build_default_architecture() -> ArchitectureModel:
         stateless_cost_per_area=STATELESS_COST_PER_AREA,
         stateful_cost_per_area=STATEFUL_COST_PER_AREA,
         defrag_trigger_free_area_multiplier=DEFRAG_TRIGGER_FREE_AREA_MULTIPLIER,
-        smart_stateless_completion_threshold=SMART_STATELESS_COMPLETION_THRESHOLD,
+        stateless_tolerance_factor=default_stateless_tolerance,
         non_monolithic_bw_factor=NON_MONOLITHIC_BW_FACTOR,
     )
     arch.validate()
     return arch
+
+
+def format_stateless_mode_label(tolerance_factor: float) -> str:
+    return f"stateless({tolerance_factor:.1f})"
+
+
+def require_stateless_tolerance_factors() -> list[float]:
+    if not STATELESS_TOLERANCE_FACTORS:
+        raise ValueError("STATELESS_TOLERANCE_FACTORS is empty; cannot run stateless mode")
+    return STATELESS_TOLERANCE_FACTORS
 
 
 def build_default_workload() -> Workload:
@@ -405,11 +415,23 @@ class Simulator:
         mode: str,
         architecture: Optional[ArchitectureModel] = None,
         workload: Optional[Workload] = None,
+        mode_label: Optional[str] = None,
         run_name: str = RUN_NAME,
         results_csv_path: str = RESULTS_CSV_PATH,
     ):
         self.mode = mode
         self.architecture = architecture if architecture is not None else build_default_architecture()
+        if self.mode == "stateless" and self.architecture.stateless_tolerance_factor is None:
+            raise ValueError("STATELESS_TOLERANCE_FACTORS is empty; cannot run stateless mode")
+        if mode_label is not None:
+            self.mode_label = mode_label
+        elif self.mode == "stateless":
+            tolerance = self.architecture.stateless_tolerance_factor
+            if tolerance is None:
+                raise ValueError("STATELESS_TOLERANCE_FACTORS is empty; cannot run stateless mode")
+            self.mode_label = format_stateless_mode_label(float(tolerance))
+        else:
+            self.mode_label = mode
 
         self.workload = workload if workload is not None else build_default_workload()
         self.workload.validate_for_architecture(self.architecture)
@@ -502,7 +524,7 @@ class Simulator:
 
             for task in self.tasks:
                 fp.write(
-                    f"{task.tid},{self.run_name},{self.mode},{task.kname},{task.status},"
+                    f"{task.tid},{self.run_name},{self.mode_label},{task.kname},{task.status},"
                     f"{task.t_arrival},{task.t_scheduled},{task.t_configured},{task.t_completed}\n"
                 )
 
@@ -597,11 +619,11 @@ class Simulator:
             if task.tid == blocked.tid:
                 continue
             if self.mode == "stateless":
-                migration_overhead = (self.architecture.config_cost_per_area + self.architecture.stateless_cost_per_area) * task.area
-                task.remaining = task.exec_total + migration_overhead
-            elif self.mode == "smart_stateless":
+                tolerance = self.architecture.stateless_tolerance_factor
+                if tolerance is None:
+                    raise ValueError("STATELESS_TOLERANCE_FACTORS is empty; cannot run stateless mode")
                 progress = 1.0 - (task.remaining / task.exec_total)
-                if progress >= self.architecture.smart_stateless_completion_threshold:
+                if progress >= tolerance:
                     continue
                 migration_overhead = (self.architecture.config_cost_per_area + self.architecture.stateless_cost_per_area) * task.area
                 task.remaining = task.exec_total + migration_overhead
@@ -756,33 +778,45 @@ def compute_metrics(sim: Simulator):
     }
 
 
-def run_to_completion(mode: str, architecture: Optional[ArchitectureModel] = None, workload: Optional[Workload] = None):
-    sim = Simulator(mode, architecture=architecture, workload=workload)
+def run_to_completion(mode: str, architecture: Optional[ArchitectureModel] = None, workload: Optional[Workload] = None, mode_label: Optional[str] = None):
+    sim = Simulator(mode, architecture=architecture, workload=workload, mode_label=mode_label)
     while not sim.done:
         sim.step()
     return sim, compute_metrics(sim)
 
 
 def print_mode_comparison(architecture: Optional[ArchitectureModel] = None, workload: Optional[Workload] = None):
-    modes = ["monolithic", "tiled", "stateless", "smart_stateless", "stateful"]
+    stateless_factors = require_stateless_tolerance_factors()
+    mode_specs = []
+    mode_specs.append(("monolithic", None, "monolithic"))
+    mode_specs.append(("tiled", None, "tiled"))
+    for f in stateless_factors:
+        mode_specs.append(("stateless", f, format_stateless_mode_label(f)))
+    mode_specs.append(("stateful", None, "stateful"))
+
     sims = {}
     metrics = {}
-    for mode in modes:
-        sim, m = run_to_completion(mode, architecture=architecture, workload=workload)
-        sims[mode] = sim
-        metrics[mode] = m
+    for mode, stateless_factor, label in mode_specs:
+        arch_for_run = architecture
+        if arch_for_run is None:
+            arch_for_run = build_default_architecture()
+        if mode == "stateless":
+            arch_for_run = replace(arch_for_run, stateless_tolerance_factor=stateless_factor)
+        sim, m = run_to_completion(mode, architecture=arch_for_run, workload=workload, mode_label=label)
+        sims[label] = sim
+        metrics[label] = m
 
     baseline_makespan = metrics["monolithic"]["makespan"]
     print("--- Mode Comparison ---")
     print(
         "mode       makespan  speedup  improve%  mean_tt  p95_tt  p99_tt  defrag(s/a)"
     )
-    for mode in modes:
-        m = metrics[mode]
+    for _, _, label in mode_specs:
+        m = metrics[label]
         speedup = baseline_makespan / m["makespan"]
         improve = ((baseline_makespan - m["makespan"]) / baseline_makespan) * 100.0
         print(
-            f"{mode:<10} {m['makespan']:>8}  {speedup:>7.3f}  {improve:>8.2f}  "
+            f"{label:<14} {m['makespan']:>8}  {speedup:>7.3f}  {improve:>8.2f}  "
             f"{m['mean_turnaround']:>7.2f}  {m['p95_turnaround']:>6}  {m['p99_turnaround']:>6}  "
             f"{m['defrag_successes']:>3}/{m['defrag_attempts']:<3}"
         )
@@ -809,7 +843,7 @@ def draw(sim: Simulator, surface, font, big_font, running_auto: bool):
 
     sx = gx + grid_w_px + 30
     lines = [
-        f"Mode: {sim.mode}",
+        f"Mode: {sim.mode_label}",
         f"Tick: {sim.tick}",
         f"Arrival cursor: {sim.arrival_cursor}/{len(sim.tasks)}",
         f"Pending: {len(sim.pending)}",
@@ -836,7 +870,7 @@ def draw(sim: Simulator, surface, font, big_font, running_auto: bool):
         "Space: pause/resume",
         "N: single tick",
         "R: reset",
-        "1/2/3/4/5: monolithic/tiled/stateless/smart/stateful",
+        "1/2/3/4: monolithic/tiled/stateless/stateful",
         "S: run to completion",
         "C: compare all modes",
         f"Auto run: {running_auto}",
@@ -866,7 +900,7 @@ def draw(sim: Simulator, surface, font, big_font, running_auto: bool):
 
 def print_summary(sim: Simulator):
     print("--- Simulation Summary ---")
-    print("mode", sim.mode)
+    print("mode", sim.mode_label)
     print("tick", sim.tick)
     print("completed", len(sim.completed), "/", len(sim.tasks))
     print("defrag_attempts", sim.defrag_attempts)
@@ -920,10 +954,10 @@ def main():
                 elif event.key == pygame.K_2:
                     sim = Simulator("tiled", architecture=architecture, workload=workload)
                 elif event.key == pygame.K_3:
-                    sim = Simulator("stateless", architecture=architecture, workload=workload)
+                    f = require_stateless_tolerance_factors()[0]
+                    stateless_arch = replace(architecture, stateless_tolerance_factor=f)
+                    sim = Simulator("stateless", architecture=stateless_arch, workload=workload, mode_label=format_stateless_mode_label(f))
                 elif event.key == pygame.K_4:
-                    sim = Simulator("smart_stateless", architecture=architecture, workload=workload)
-                elif event.key == pygame.K_5:
                     sim = Simulator("stateful", architecture=architecture, workload=workload)
 
         if auto_run and not sim.done:

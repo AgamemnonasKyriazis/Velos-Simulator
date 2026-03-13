@@ -39,35 +39,29 @@ def eval_triplet(f_ratio, e_ratio, b_ratio, n_jobs=None):
         sim.MAX_JOB_CYCLES,
     )
 
-    _, mono = sim.run_to_completion("monolithic", architecture=arch, workload=workload)
     _, tiled = sim.run_to_completion("tiled", architecture=arch, workload=workload)
     _, stateful = sim.run_to_completion("stateful", architecture=arch, workload=workload)
 
-    if mono is None or tiled is None or stateful is None:
+    if tiled is None or stateful is None:
         raise RuntimeError("Simulation did not produce metrics for one of the modes")
 
-    mono_mk     = mono["makespan"]
     tiled_mk    = tiled["makespan"]
     stateful_mk = stateful["makespan"]
 
-    mono_p95     = mono["p95_turnaround"]
     tiled_p95    = tiled["p95_turnaround"]
     stateful_p95 = stateful["p95_turnaround"]
 
-    tiled_impr    = (mono_p95 - tiled_p95) / mono_p95    # (mono_mk - tiled_mk) / mono_mk
-    stateful_impr = (mono_p95 - stateful_p95) / mono_p95 # (mono_mk - stateful_mk) / mono_mk
-
-    objective     = (stateful_impr - tiled_impr)
+    # objective = (tiled_p95 - stateful_p95) / tiled_p95
+    objective = (stateful["defrag_successes"] * 0.01) + (tiled_p95 - stateful_p95) / tiled_p95
 
     return {
         "f": f_ratio,
         "e": e_ratio,
         "b": b_ratio,
-        "mono": mono_mk,
         "tiled": tiled_mk,
         "stateful": stateful_mk,
-        "tiled_impr": tiled_impr,
-        "stateful_impr": stateful_impr,
+        "tiled_p95": tiled_p95,
+        "stateful_p95": stateful_p95,
         "objective": objective,
         "direct_gain_vs_tiled": (tiled_mk - stateful_mk) / tiled_mk,
         "defrag_successes": stateful["defrag_successes"],
@@ -154,15 +148,8 @@ def dump_top_candidates(candidates, n_jobs):
             "ratios": {"fragment": row["f"], "elephant": row["e"], "background": row["b"]},
             "objective": row["objective"],
             "direct_gain_vs_tiled": row["direct_gain_vs_tiled"],
-            "makespan": {
-                "monolithic": row["mono"],
-                "tiled": row["tiled"],
-                "stateful": row["stateful"],
-            },
-            "improvement_vs_monolithic": {
-                "tiled": row["tiled_impr"],
-                "stateful": row["stateful_impr"],
-            },
+            "makespan": {"tiled": row["tiled"], "stateful": row["stateful"]},
+            "p95": {"tiled": row["tiled_p95"], "stateful": row["stateful_p95"]},
             "sim_config": {
                 "workload_seed": sim.WORKLOAD_SEED,
                 "workload_profile": "realistic",
@@ -176,7 +163,7 @@ def dump_top_candidates(candidates, n_jobs):
                 "stateless_cost_per_area": arch.stateless_cost_per_area,
                 "stateful_cost_per_area": arch.stateful_cost_per_area,
                 "trigger_multiplier": arch.defrag_trigger_free_area_multiplier,
-                "smart_threshold": arch.smart_stateless_completion_threshold,
+                "stateless_tolerance_factor": arch.stateless_tolerance_factor,
                 "non_monolithic_bw_factor": arch.non_monolithic_bw_factor,
             },
         }
@@ -199,9 +186,10 @@ def dump_top_candidates(candidates, n_jobs):
             "b": row["b"],
             "objective": row["objective"],
             "direct_gain_vs_tiled": row["direct_gain_vs_tiled"],
-            "mono": row["mono"],
             "tiled": row["tiled"],
             "stateful": row["stateful"],
+            "tiled_p95": row["tiled_p95"],
+            "stateful_p95": row["stateful_p95"],
             "meta_file": str(meta_path),
             "task_queue_file": str(queue_path),
         })
@@ -248,12 +236,9 @@ def main():
 
     print("=== BEST RATIOS ===")
     print(f"F={best['f']:.4f}, E={best['e']:.4f}, B={best['b']:.4f}")
-    print(f"Monolithic makespan: {best['mono']}")
     print(f"Tiled makespan:      {best['tiled']}")
     print(f"Stateful makespan:   {best['stateful']}")
-    print(f"Tiled improvement:   {pct(best['tiled_impr'])}")
-    print(f"Stateful improvement:{pct(best['stateful_impr'])}")
-    print(f"Objective (S-T):     {pct(best['objective'])}")
+    print(f"Objective (p95 gain):{pct(best['objective'])}")
     print(f"Direct gain vs tiled:{pct(best['direct_gain_vs_tiled'])}")
 
     print("\n=== TOP CANDIDATES (fine) ===")
@@ -263,7 +248,7 @@ def main():
             f"F={row['f']:.3f} E={row['e']:.3f} B={row['b']:.3f} | "
             f"obj={pct(row['objective'])} | "
             f"gain_vs_tiled={pct(row['direct_gain_vs_tiled'])} | "
-            f"mk(m/t/s)=({row['mono']}/{row['tiled']}/{row['stateful']})"
+            f"mk(t/s)=({row['tiled']}/{row['stateful']})"
         )
 
     dumped_dir = dump_top_candidates(top_rows, args.n_jobs)

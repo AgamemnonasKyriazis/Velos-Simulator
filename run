@@ -1,1 +1,1 @@
-N_JOBS=64 COARSE_STEP=0.2 FINE_STEP=0.05 TOP=10 bash ~/work/ipy/run_ratio_sweep.sh
+N_JOBS=64 COARSE_STEP=0.1 FINE_STEP=0.05 TOP=10 bash ~/work/ipy/run_ratio_sweep.sh

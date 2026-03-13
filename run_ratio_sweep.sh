@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON="/home/akyriazis/work/ipy/.venv/bin/python"
-OPT="/home/akyriazis/work/ipy/optimize_ratios.py"
+PYTHON=".venv/bin/python"
+OPT="optimize_ratios.py"
 
 OUT_DIR="${OUT_DIR:-$HOME/tmp}"
 mkdir -p "${OUT_DIR}"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 # Sweep config (override via env vars)
-N_JOBS="${N_JOBS:-128}"
+N_JOBS="${N_JOBS:-64}"
 COARSE_STEP="${COARSE_STEP:-0.10}"
 FINE_STEP="${FINE_STEP:-0.02}"
 RADIUS="${RADIUS:-0.06}"
-TOP="${TOP:-15}"
+TOP="${TOP:-20}"
 
 OUT_FILE="${OUT_DIR}/ratio_opt_${N_JOBS}_${TS}.txt"
 
@@ -25,7 +25,8 @@ echo "Output file: ${OUT_FILE}"
   --coarse-step "${COARSE_STEP}" \
   --fine-step "${FINE_STEP}" \
   --radius "${RADIUS}" \
-  --top "${TOP}" | tee "${OUT_FILE}"
+  --top "${TOP}" \
+  --workers 8 | tee "${OUT_FILE}"\
 
 echo
 echo "Done. Best result:"
